@@ -1,0 +1,181 @@
+name: Assinar APK Xiaomi Completo
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sign-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Baixar repositório
+        uses: actions/checkout@v4
+
+      - name: Preparar Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Preparar Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Instalar Build Tools
+        shell: bash
+        run: |
+          set -e
+          sdkmanager "build-tools;35.0.0"
+          echo "$ANDROID_HOME/build-tools/35.0.0" >> "$GITHUB_PATH"
+
+      - name: Recuperar chave de assinatura
+        id: signing-cache
+        uses: actions/cache@v4
+        with:
+          path: .signing
+          key: bigger-pro-signing-key-v1
+
+      - name: Criar chave de assinatura se não existir
+        shell: bash
+        run: |
+          set -e
+          mkdir -p .signing
+
+          if [ ! -f .signing/bigger-release.jks ]; then
+            echo "Criando nova chave de assinatura..."
+            keytool -genkeypair \
+              -keystore .signing/bigger-release.jks \
+              -storepass BiggerPro2026 \
+              -keypass BiggerPro2026 \
+              -alias biggerpro \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Grupo Bigger, OU=Android, O=Grupo Bigger, L=Colatina, ST=ES, C=BR"
+          else
+            echo "Usando a mesma chave de assinatura salva no cache."
+          fi
+
+          test -s .signing/bigger-release.jks
+
+      - name: Localizar partes do APK
+        id: parts
+        shell: bash
+        run: |
+          set -e
+
+          echo "Arquivos encontrados:"
+          find . -maxdepth 6 -type f | sort
+
+          PART0="$(find . -maxdepth 6 -type f \( \
+            -iname '*part-00' -o \
+            -iname '*parte-00' \
+          \) | head -n 1)"
+
+          PART1="$(find . -maxdepth 6 -type f \( \
+            -iname '*part-01' -o \
+            -iname '*parte-01' \
+          \) | head -n 1)"
+
+          if [ -z "$PART0" ] || [ -z "$PART1" ]; then
+            echo "ERRO: não encontrei as duas partes do APK."
+            echo "Preciso de:"
+            echo "  arquivo terminado em part-00 ou parte-00"
+            echo "  arquivo terminado em part-01 ou parte-01"
+            exit 1
+          fi
+
+          echo "Parte 00: $PART0"
+          echo "Parte 01: $PART1"
+
+          echo "part0=$PART0" >> "$GITHUB_OUTPUT"
+          echo "part1=$PART1" >> "$GITHUB_OUTPUT"
+
+      - name: Juntar partes do APK
+        shell: bash
+        run: |
+          set -e
+          mkdir -p work output
+
+          cat "${{ steps.parts.outputs.part0 }}" \
+              "${{ steps.parts.outputs.part1 }}" \
+              > work/BIGGER-PRO.apk
+
+          echo "APK reconstruído:"
+          ls -lh work/BIGGER-PRO.apk
+
+          unzip -t work/BIGGER-PRO.apk > /dev/null
+          echo "ZIP/APK reconstruído com sucesso."
+
+      - name: Remover assinatura antiga
+        shell: bash
+        run: |
+          set -e
+          cp work/BIGGER-PRO.apk work/unsigned.apk
+
+          zip -d work/unsigned.apk \
+            'META-INF/*.RSA' \
+            'META-INF/*.DSA' \
+            'META-INF/*.EC' \
+            'META-INF/*.SF' \
+            'META-INF/MANIFEST.MF' || true
+
+      - name: Alinhar APK
+        shell: bash
+        run: |
+          set -e
+          zipalign -f -p 4 work/unsigned.apk work/aligned.apk
+          zipalign -c -v 4 work/aligned.apk
+
+      - name: Assinar APK v1 + v2 + v3
+        shell: bash
+        run: |
+          set -e
+
+          apksigner sign \
+            --ks .signing/bigger-release.jks \
+            --ks-key-alias biggerpro \
+            --ks-pass pass:BiggerPro2026 \
+            --key-pass pass:BiggerPro2026 \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            --out output/BIGGER-PRO-XIAOMI-SIGNED.apk \
+            work/aligned.apk
+
+      - name: Validar assinatura
+        shell: bash
+        run: |
+          set -e
+
+          echo "===== APKSIGNER ====="
+          apksigner verify --verbose --print-certs \
+            output/BIGGER-PRO-XIAOMI-SIGNED.apk
+
+          echo "===== ZIPALIGN ====="
+          zipalign -c -v 4 output/BIGGER-PRO-XIAOMI-SIGNED.apk
+
+          echo "===== HASH SHA256 ====="
+          sha256sum output/BIGGER-PRO-XIAOMI-SIGNED.apk
+
+          echo "===== TAMANHO ====="
+          ls -lh output/BIGGER-PRO-XIAOMI-SIGNED.apk
+
+      - name: Enviar APK pronto
+        uses: actions/upload-artifact@v4
+        with:
+          name: BIGGER-PRO-XIAOMI-SIGNED
+          path: output/BIGGER-PRO-XIAOMI-SIGNED.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Enviar chave de assinatura
+        uses: actions/upload-artifact@v4
+        with:
+          name: BIGGER-PRO-SIGNING-KEY
+          path: .signing/bigger-release.jks
+          if-no-files-found: error
+          retention-days: 30
