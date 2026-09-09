@@ -1,0 +1,167 @@
+name: Assinar APK Xiaomi por Partes V2
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sign-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Baixar repositório
+        uses: actions/checkout@v4
+
+      - name: Preparar Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Preparar Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Instalar Build Tools
+        shell: bash
+        run: |
+          sdkmanager "build-tools;35.0.0"
+          echo "$ANDROID_HOME/build-tools/35.0.0" >> "$GITHUB_PATH"
+
+      - name: Localizar partes do APK
+        id: parts
+        shell: bash
+        run: |
+          set -e
+
+          echo "Arquivos encontrados no repositório:"
+          find . -maxdepth 5 -type f | sort
+
+          PART0="$(find . -maxdepth 5 -type f \( \
+            -iname 'BIGGER-PRO-V41.part-00' -o \
+            -iname 'BIGGER-PRO-V41.parte-00' -o \
+            -iname '*part-00' -o \
+            -iname '*parte-00' \
+          \) | head -n 1)"
+
+          PART1="$(find . -maxdepth 5 -type f \( \
+            -iname 'BIGGER-PRO-V41.part-01' -o \
+            -iname 'BIGGER-PRO-V41.parte-01' -o \
+            -iname '*part-01' -o \
+            -iname '*parte-01' \
+          \) | head -n 1)"
+
+          if [ -z "$PART0" ] || [ -z "$PART1" ]; then
+            echo "ERRO: Não encontrei as duas partes do APK."
+            echo "Preciso de um arquivo terminado em part-00/parte-00"
+            echo "e outro terminado em part-01/parte-01."
+            exit 1
+          fi
+
+          echo "Parte 00: $PART0"
+          echo "Parte 01: $PART1"
+          echo "part0=$PART0" >> "$GITHUB_OUTPUT"
+          echo "part1=$PART1" >> "$GITHUB_OUTPUT"
+
+      - name: Juntar partes do APK
+        shell: bash
+        run: |
+          set -e
+          mkdir -p work output
+
+          cat "${{ steps.parts.outputs.part0 }}" \
+              "${{ steps.parts.outputs.part1 }}" \
+              > work/BIGGER-PRO-V41.apk
+
+          echo "APK reconstruído:"
+          ls -lh work/BIGGER-PRO-V41.apk
+          file work/BIGGER-PRO-V41.apk
+
+          unzip -t work/BIGGER-PRO-V41.apk >/dev/null
+          echo "APK reconstruído com ZIP válido."
+
+      - name: Restaurar keystore dos Secrets
+        shell: bash
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -e
+
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "Secret ANDROID_KEYSTORE_BASE64 não configurado."
+            exit 1
+          fi
+
+          printf '%s' "$KEYSTORE_B64" | base64 --decode > release-keystore.jks
+          test -s release-keystore.jks
+
+      - name: Remover assinatura antiga
+        shell: bash
+        run: |
+          set -e
+          cp work/BIGGER-PRO-V41.apk work/input.apk
+
+          zip -d work/input.apk \
+            'META-INF/*.RSA' \
+            'META-INF/*.DSA' \
+            'META-INF/*.EC' \
+            'META-INF/*.SF' \
+            'META-INF/MANIFEST.MF' || true
+
+      - name: Zipalign
+        shell: bash
+        run: |
+          set -e
+          zipalign -f -p 4 work/input.apk work/aligned.apk
+          zipalign -c -v 4 work/aligned.apk
+
+      - name: Assinar com v1 + v2 + v3
+        shell: bash
+        env:
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -e
+
+          if [ -z "$KS_PASS" ] || [ -z "$KEY_ALIAS" ] || [ -z "$KEY_PASS" ]; then
+            echo "Configure todos os Secrets de assinatura."
+            exit 1
+          fi
+
+          apksigner sign \
+            --ks release-keystore.jks \
+            --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass "pass:$KS_PASS" \
+            --key-pass "pass:$KEY_PASS" \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            --out output/BIGGER-PRO-XIAOMI-SIGNED.apk \
+            work/aligned.apk
+
+      - name: Validar APK final
+        shell: bash
+        run: |
+          set -e
+
+          echo "===== ASSINATURA ====="
+          apksigner verify --verbose --print-certs \
+            output/BIGGER-PRO-XIAOMI-SIGNED.apk
+
+          echo "===== ALINHAMENTO ====="
+          zipalign -c -v 4 output/BIGGER-PRO-XIAOMI-SIGNED.apk
+
+          echo "===== TAMANHO / HASH ====="
+          ls -lh output/BIGGER-PRO-XIAOMI-SIGNED.apk
+          sha256sum output/BIGGER-PRO-XIAOMI-SIGNED.apk
+
+      - name: Enviar APK pronto
+        uses: actions/upload-artifact@v4
+        with:
+          name: BIGGER-PRO-XIAOMI-SIGNED
+          path: output/BIGGER-PRO-XIAOMI-SIGNED.apk
+          if-no-files-found: error
+          retention-days: 30
